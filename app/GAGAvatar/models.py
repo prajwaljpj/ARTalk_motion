@@ -7,15 +7,17 @@ import math
 import torch
 import torchvision
 import torch.nn as nn
+import torch.nn.functional as F
 from pytorch3d.transforms import axis_angle_to_matrix
 from pytorch3d.renderer.implicit.harmonic_embedding import HarmonicEmbedding
 
 from .modules import DINOBase, StyleUNet
-from .utils_renderer import render_gaussian
+from .utils_renderer import render_gaussian, create_background_gaussians
 
 class GAGAvatar(nn.Module):
-    def __init__(self, ):
+    def __init__(self, projection_mode='perspective', zoom=1.0):
         super().__init__()
+        self.projection_mode = projection_mode
         self.base_model = DINOBase(output_dim=256)
         for param in self.base_model.dino_model.parameters():
             param.requires_grad = False
@@ -28,7 +30,7 @@ class GAGAvatar(nn.Module):
         self.gs_generator_g = LinearGSGenerator(in_dim=1024, dir_dim=self.direnc_dim)
         self.gs_generator_l0 = ConvGSGenerator(in_dim=256, dir_dim=self.direnc_dim)
         self.gs_generator_l1 = ConvGSGenerator(in_dim=256, dir_dim=self.direnc_dim)
-        self.cam_params = {'focal_x': 12.0, 'focal_y': 12.0, 'size': [512, 512]}
+        self.cam_params = {'focal_x': 12.0 * zoom, 'focal_y': 12.0 * zoom, 'size': [512, 512]}
         self.upsampler = StyleUNet(in_size=512, in_dim=32, out_dim=3, out_size=512)
 
         _abs_path = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +61,8 @@ class GAGAvatar(nn.Module):
             del self.feature_batch
         if hasattr(self, 'shapecode'):
             del self.shapecode
+        if hasattr(self, '_cached_background_gaussians'):
+            del self._cached_background_gaussians
 
     @torch.no_grad()
     def forward_expression(self, batch):
@@ -88,8 +92,26 @@ class GAGAvatar(nn.Module):
         gs_params = self._gs_params
         t_image, t_points, t_transform = batch['t_image'], batch['t_points'], batch['t_transform']
         gs_params['xyz'][:, :5023] = t_points
+
+        # --- FINAL PIVOT POINT CORRECTION ---
+        # 1. Calculate the true center of the *final, combined* 3D model
+        true_model_center = gs_params['xyz'].mean(dim=1)
+        
+        # 2. Extract the rotation (R) and original translation (T) from the camera matrix
+        rotation = t_transform[:, :3, :3]
+        translation = t_transform[:, :3, 3]
+        
+        # 3. Calculate the corrected translation to orbit the true center
+        rotated_center = torch.bmm(rotation, true_model_center.unsqueeze(-1)).squeeze(-1)
+        corrected_translation = translation + true_model_center - rotated_center
+        
+        # 4. Build the final, stable camera matrix
+        stable_transform = t_transform.clone()
+        stable_transform[:, :3, 3] = corrected_translation
+
         gen_images = render_gaussian(
-            gs_params=gs_params, cam_matrix=t_transform, cam_params=self.cam_params
+            gs_params=gs_params, cam_matrix=stable_transform, cam_params=self.cam_params,
+            projection_mode=self.projection_mode
         )['images']
         sr_gen_images = self.upsampler(gen_images)
         return self.add_water_mark(sr_gen_images.clamp(0, 1))
@@ -129,12 +151,12 @@ class GAGAvatar(nn.Module):
 
     @torch.no_grad()
     def add_water_mark(self, image):
-        water_mark = self._water_mark.clone().to(image.device)
-        _water_mark_rgb = water_mark[None, :3]
-        _water_mark_alpha = water_mark[None, 3:4].expand(-1, 3, -1, -1) * 0.8
-        _mark_patch = image[..., -water_mark.shape[-2]:, -water_mark.shape[-1]:]
-        _mark_patch = _mark_patch * (1-_water_mark_alpha) + _water_mark_rgb * _water_mark_alpha
-        image[..., -water_mark.shape[-2]:, -water_mark.shape[-1]:] = _mark_patch
+        # water_mark = self._water_mark.clone().to(image.device)
+        # _water_mark_rgb = water_mark[None, :3]
+        # _water_mark_alpha = water_mark[None, 3:4].expand(-1, 3, -1, -1) * 0.8
+        # _mark_patch = image[..., -water_mark.shape[-2]:, -water_mark.shape[-1]:]
+        # _mark_patch = _mark_patch * (1-_water_mark_alpha) + _water_mark_rgb * _water_mark_alpha
+        # image[..., -water_mark.shape[-2]:, -water_mark.shape[-1]:] = _mark_patch
         return image
 
 
@@ -329,3 +351,8 @@ forehead_indices = [
     3158, 3157, 336, 335, 3153, 3705, 2177, 2176, 3540, 671, 672, 3863, 2134, 16, 17, 2138, 2139,
     2567, 2566, 337, 338, 3154, 3712, 2178, 2179, 3495, 674, 673, 3868, 2135, 27, 18, 1429, 1430
 ]
+
+
+
+
+

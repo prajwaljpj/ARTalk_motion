@@ -16,17 +16,18 @@ from pytorch3d.renderer import (
     PointsRenderer, PointsRasterizer, AlphaCompositor,
     PointLights, AmbientLights, TexturesVertex, TexturesUV, 
     HardGouraudShader, HardPhongShader, SoftPhongShader, SoftSilhouetteShader,
-    MeshRasterizer, MeshRenderer, Materials
+    MeshRasterizer, MeshRenderer, Materials, OrthographicCameras
 )
 
 
 class RenderMesh(nn.Module):
-    def __init__(self, image_size, obj_filename=None, faces=None, scale=1.0):
+    def __init__(self, image_size, obj_filename=None, faces=None, scale=1.0, projection_mode='perspective'):
         super(RenderMesh, self).__init__()
         self.ori_size = image_size
         image_size = int(image_size)
         self.scale = scale
         self.image_size = image_size
+        self.projection_mode = projection_mode
         if obj_filename is not None:
             verts, faces, aux = load_obj(obj_filename, load_textures=False)
             self.faces = faces.verts_idx
@@ -45,11 +46,23 @@ class RenderMesh(nn.Module):
         screen_size = torch.tensor(
             [self.image_size, self.image_size], device=device
         ).float()[None].repeat(batch_size, 1)
-        cameras_kwargs = {
-            'principal_point': torch.zeros(batch_size, 2, device=device).float(), 'focal_length': focal_length, 
-            'image_size': screen_size, 'device': device,
-        }
-        cameras = PerspectiveCameras(**cameras_kwargs, R=transform_matrix[:, :3, :3], T=transform_matrix[:, :3, 3])
+        
+        if self.projection_mode == 'orthographic':
+            # For orthographic, focal_length is effectively ignored, but we can use it to set the scale.
+            # A higher value here makes the object appear smaller (zoomed out).
+            # We'll use a fixed high value to ensure the head fits in the frame.
+            cameras_kwargs = {
+                'focal_length': torch.full((batch_size, 2), 2.0, device=device), # This controls scale in ortho
+                'principal_point': torch.zeros(batch_size, 2, device=device).float(),
+                'image_size': screen_size, 'device': device,
+            }
+            cameras = OrthographicCameras(**cameras_kwargs, R=transform_matrix[:, :3, :3], T=transform_matrix[:, :3, 3])
+        else: # 'perspective'
+            cameras_kwargs = {
+                'principal_point': torch.zeros(batch_size, 2, device=device).float(), 'focal_length': focal_length, 
+                'image_size': screen_size, 'device': device,
+            }
+            cameras = PerspectiveCameras(**cameras_kwargs, R=transform_matrix[:, :3, :3], T=transform_matrix[:, :3, 3])
         return cameras
 
     @torch.no_grad()
